@@ -17,6 +17,9 @@
 #include "Delegate/FUnrealCSharpCoreModuleDelegates.h"
 #endif
 #include "UEVersion.h"
+#include "CoreMacro/PropertyAttributeMacro.h"
+#include "Engine/InheritableComponentHandler.h"
+#include "Engine/SCS_Node.h"
 
 TSet<UClass::ClassConstructorType> FDynamicClassGenerator::ClassConstructorSet
 {
@@ -24,6 +27,8 @@ TSet<UClass::ClassConstructorType> FDynamicClassGenerator::ClassConstructorSet
 };
 
 TMap<UClass*, FString> FDynamicClassGenerator::NamespaceMap;
+
+TMap<UClass*,TArray<FDynamicClassGenerator::FDefaultSubObject>> FDynamicClassGenerator::DefaultSubObjectMap;
 
 TMap<FString, UClass*> FDynamicClassGenerator::DynamicClassMap;
 
@@ -556,7 +561,7 @@ void FDynamicClassGenerator::ReInstance(UClass* InOldClass, UClass* InNewClass)
 void FDynamicClassGenerator::GeneratorProperty(MonoClass* InMonoClass, UClass* InClass)
 {
 	FDynamicGeneratorCore::GeneratorProperty(InMonoClass, InClass,
-	                                         [InClass](const FProperty* InProperty)
+	                                         [InClass](const MonoProperty* InMonoProperty, MonoCustomAttrInfo* InMonoCustomAttrInfo, const FProperty* InProperty)
 	                                         {
 		                                         if (InProperty->HasAnyPropertyFlags(CPF_Net))
 		                                         {
@@ -592,8 +597,53 @@ void FDynamicClassGenerator::GeneratorProperty(MonoClass* InMonoClass, UClass* I
 				                                         Blueprint->NewVariables.Add(BPVariableDescription);
 			                                         }
 		                                         }
+
 #endif
+
+	                                         	if (IsDynamicBlueprintGeneratedClass(InClass))
+	                                         	{
+	                                         		if (FDynamicGeneratorCore::AttrsHasAttr(InMonoCustomAttrInfo, CLASS_DEFAULT_SUB_OBJECT_ATTRIBUTE))
+	                                         		{
+														 FDefaultSubObject DefaultSubObject;
+
+														 DefaultSubObject.Property = CastField<FObjectProperty>(InProperty);
+
+														 if (FDynamicGeneratorCore::AttrsHasAttr(InMonoCustomAttrInfo, CLASS_ROOT_COMPONENT_ATTRIBUTE))
+														 {
+															 DefaultSubObject.bIsRootComponent = true;
+														 }
+
+														 DefaultSubObject.Parent = FDynamicGeneratorCore::AttrsHasAttr(
+																 InMonoCustomAttrInfo,
+																 CLASS_ATTACHMENT_PARENT_ATTRIBUTE)
+																 ? FDynamicGeneratorCore::AttrGetValue(
+																	 InMonoCustomAttrInfo,
+																	 CLASS_ATTACHMENT_PARENT_ATTRIBUTE)
+																 : FString{};
+
+														 DefaultSubObject.Socket = FDynamicGeneratorCore::AttrsHasAttr(
+																 InMonoCustomAttrInfo,
+																 CLASS_ATTACHMENT_SOCKET_NAME_ATTRIBUTE)
+																 ? FDynamicGeneratorCore::AttrGetValue(
+																	 InMonoCustomAttrInfo,
+																	 CLASS_ATTACHMENT_SOCKET_NAME_ATTRIBUTE)
+																 : FString{};
+												 	
+														 DefaultSubObjectMap.FindOrAdd(InClass).Add(DefaultSubObject);
+													 }
+	                                         	}
 	                                         });
+
+	if (IsDynamicBlueprintGeneratedClass(InClass))
+	{
+		if (DefaultSubObjectMap.Contains(InClass))
+		{
+			DefaultSubObjectMap[InClass].StableSort([](const FDefaultSubObject& A, const FDefaultSubObject& B)
+			{
+				return A.bIsRootComponent;
+			});
+		}
+	}
 }
 
 void FDynamicClassGenerator::GeneratorFunction(MonoClass* InMonoClass, UClass* InClass)
@@ -633,38 +683,198 @@ void FDynamicClassGenerator::GeneratorInterface(MonoClass* InMonoClass, UClass* 
 	}
 }
 
+void UpdateTemplateComponent(USCS_Node* Node, UObject* GeneratedClass, UClass* NewComponentClass, FName NewComponentVariableName)
+{
+	UPackage* TransientPackage = GetTransientPackage();
+	UActorComponent* NewComponentTemplate = NewObject<UActorComponent>(TransientPackage, NewComponentClass, NAME_None, RF_ArchetypeObject | RF_Public);
+
+	FString Name = NewComponentVariableName.ToString() + TEXT("_GEN_VARIABLE");
+	UObject* Collision = FindObject<UObject>(GeneratedClass, *Name);
+	
+	while (Collision)
+	{
+		Collision->Rename(nullptr, TransientPackage, REN_DoNotDirty | REN_DontCreateRedirectors);
+		Collision = FindObject<UObject>(GeneratedClass, *Name);
+	}
+
+	NewComponentTemplate->Rename(*Name, GeneratedClass, REN_DoNotDirty | REN_DontCreateRedirectors);
+	
+	Node->ComponentClass = NewComponentTemplate->GetClass();
+	Node->ComponentTemplate = NewComponentTemplate;
+}
+
+
+USCS_Node* CreateNode(USimpleConstructionScript* SimpleConstructionScript, UObject* GeneratedClass, UClass* NewComponentClass, FName NewComponentVariableName)
+{
+	USCS_Node* NewNode = NewObject<USCS_Node>(SimpleConstructionScript, MakeUniqueObjectName(SimpleConstructionScript, USCS_Node::StaticClass()));
+	NewNode->SetFlags(RF_Transient);
+	NewNode->SetVariableName(NewComponentVariableName, false);
+	NewNode->VariableGuid = FGuid::NewGuid();
+	
+	UpdateTemplateComponent(NewNode, GeneratedClass, NewComponentClass, NewComponentVariableName);
+	
+	SimpleConstructionScript->AddNode(NewNode);
+	return NewNode;
+}
+
+void UpdateChildren(UClass* Outer, USCS_Node* Node)
+{
+	// Unreal's component system doesn't support changing the component class of a node, unless you remove and then re-add the node
+	// This is a workaround to not make the system consider our new template as garbage as it's not yet used in the UInheritableComponentHandler
+#if WITH_EDITOR
+	FComponentKey ComponentKey(Node);
+	TArray<UClass*> ChildClasses;
+	GetDerivedClasses(Outer, ChildClasses);
+
+	for (const UClass* ChildClass : ChildClasses)
+	{
+		const UBlueprint* Blueprint = Cast<UBlueprint>(ChildClass->ClassGeneratedBy);
+
+		if (!IsValid(Blueprint))
+		{
+			continue;
+		}
+
+		UActorComponent* Template = Blueprint->InheritableComponentHandler->GetOverridenComponentTemplate(ComponentKey);
+			
+		if (!IsValid(Template))
+		{
+			continue;
+		}
+		
+		Template->Rename(nullptr, GetTransientPackage(), REN_DoNotDirty | REN_DontCreateRedirectors);
+		Template->ClearFlags(RF_Standalone);
+		Template->RemoveFromRoot();
+		
+		Blueprint->InheritableComponentHandler->RemoveOverridenComponentTemplate(ComponentKey);
+	}
+#endif
+}
+
 void FDynamicClassGenerator::ClassConstructor(const FObjectInitializer& InObjectInitializer)
 {
 	const auto Object = InObjectInitializer.GetObj();
 
-	auto SuperClass = InObjectInitializer.GetClass();
+	auto Class = InObjectInitializer.GetClass();
 
-	while (SuperClass != nullptr)
+	while (Class != nullptr)
 	{
-		if (IsDynamicClass(SuperClass))
+		if (IsDynamicClass(Class))
 		{
-			for (TFieldIterator<FProperty> It(SuperClass, EFieldIteratorFlags::ExcludeSuper,
-			                                  EFieldIteratorFlags::ExcludeDeprecated); It; ++It)
+			for (TFieldIterator<FProperty> It(Class, EFieldIteratorFlags::ExcludeSuper,
+											  EFieldIteratorFlags::ExcludeDeprecated); It; ++It)
 			{
 				It->InitializeValue(It->ContainerPtrToValuePtr<void>(Object));
 			}
 		}
 
-		SuperClass = SuperClass->GetSuperClass();
+		Class = Class->GetSuperClass();
 	}
 
-	SuperClass = InObjectInitializer.GetClass();
+	Class = InObjectInitializer.GetClass();
 
-	while (SuperClass != nullptr)
+	while (Class != nullptr)
 	{
-		if (SuperClass->ClassConstructor != nullptr && !ClassConstructorSet.Contains(SuperClass->ClassConstructor))
+		if (Class->ClassConstructor != nullptr && !ClassConstructorSet.Contains(Class->ClassConstructor))
 		{
-			SuperClass->ClassConstructor(InObjectInitializer);
+			Class->ClassConstructor(InObjectInitializer);
 
 			break;
 		}
 
-		SuperClass = SuperClass->GetSuperClass();
+		Class = Class->GetSuperClass();
+	}
+
+	Class = InObjectInitializer.GetClass();
+
+	if (Class->IsChildOf(AActor::StaticClass()))
+	{
+		if (DefaultSubObjectMap.Contains(Class))
+		{
+			if (IsDynamicBlueprintGeneratedClass(Class))
+			{
+				struct FCSAttachmentNode
+				{
+					USCS_Node* Node;
+					FName AttachToComponentName;
+				};
+				
+				USimpleConstructionScript* SimpleConstructionScript = Cast<UBlueprintGeneratedClass>(Class)->SimpleConstructionScript;
+				
+				TArray<FCSAttachmentNode> AttachmentNodes;
+				
+				for (auto DefaultSubObject: DefaultSubObjectMap[Class])
+				{
+					if (!IsValid(SimpleConstructionScript))
+					{
+						SimpleConstructionScript = NewObject<USimpleConstructionScript>(Class, NAME_None, RF_Transient);
+
+						Cast<UBlueprintGeneratedClass>(Class)->SimpleConstructionScript = SimpleConstructionScript;
+					}
+				
+					UClass* PropertyClass = DefaultSubObject.Property->PropertyClass;
+
+					USCS_Node* Node = SimpleConstructionScript->FindSCSNode(*DefaultSubObject.Property->GetName());
+				
+					if (!Node)
+					{
+						Node = CreateNode(SimpleConstructionScript, Class, PropertyClass, *DefaultSubObject.Property->GetName());
+					}
+					else if (PropertyClass != Node->ComponentClass)
+					{
+						UpdateChildren(Class, Node);
+						UpdateTemplateComponent(Node, Class, PropertyClass, *DefaultSubObject.Property->GetName());
+					}
+				
+					FName AttachToComponentName = DefaultSubObject.Parent.IsEmpty() ? NAME_None : FName(*DefaultSubObject.Parent);
+					
+					bool HasValidAttachment = AttachToComponentName != NAME_None;
+				
+					Node->AttachToName = HasValidAttachment ? FName(*DefaultSubObject.Socket) : NAME_None;
+
+					if (HasValidAttachment)
+					{
+						FCSAttachmentNode AttachmentNode;
+						AttachmentNode.Node = Node;
+						AttachmentNode.AttachToComponentName = AttachToComponentName;
+						AttachmentNodes.Add(AttachmentNode);
+					}
+				}
+
+				for (const FCSAttachmentNode& AttachmentNode : AttachmentNodes)
+				{
+					FName AttachToComponentName = AttachmentNode.AttachToComponentName;
+					USCS_Node* Node = AttachmentNode.Node;
+					USCS_Node* ParentNode = SimpleConstructionScript->FindSCSNode(AttachToComponentName);
+
+					if (!ParentNode)
+					{
+						ParentNode = SimpleConstructionScript->GetRootNodes()[0];
+					}
+					
+					if (ParentNode->ChildNodes.Contains(Node))
+					{
+						return;
+					}
+
+					ParentNode->AddChildNode(Node);
+					
+					Node->bIsParentComponentNative = false;
+					Node->ParentComponentOrVariableName = AttachToComponentName;
+					Node->ParentComponentOwnerClassName = Cast<UBlueprintGeneratedClass>(Class)->SimpleConstructionScript->GetFName();
+					
+					for (USCS_Node* NodeItr : SimpleConstructionScript->GetAllNodes())
+					{
+						if (NodeItr != Node && NodeItr->ChildNodes.Contains(Node) && NodeItr->GetVariableName() != AttachToComponentName)
+						{
+							// The attachment has changed, remove the node from the old parent
+							NodeItr->RemoveChildNode(Node, false);
+							break;
+						}
+					}
+				}
+			}
+		}
 	}
 }
 
