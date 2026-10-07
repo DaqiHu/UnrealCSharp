@@ -1,12 +1,25 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 using UnrealBuildTool;
+using System.IO;
+using System.Text.RegularExpressions;
 
 public class UnrealCSharp : ModuleRules
 {
 	public UnrealCSharp(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
+
+		// Some Engine forks, including Hazelight, already provide these types.
+		// Detect the actual header rather than attributing fork additions to UE 5.8.
+		var CoreClassHeader = Path.Combine(EngineDirectory, "Source", "Runtime", "CoreUObject", "Public", "UObject", "Class.h");
+		ExternalDependencies.Add(CoreClassHeader);
+		var CoreClassSource = File.ReadAllText(CoreClassHeader);
+		foreach (var StructName in new[] { "FBox", "FBoxSphereBounds" })
+		{
+			var HasSpecialization = Regex.IsMatch(CoreClassSource, @"template\s*<>\s*struct\s+TBaseStructure\s*<\s*" + StructName + @"\s*>");
+			PublicDefinitions.Add("UNREALCSHARP_ENGINE_BASE_" + StructName.ToUpperInvariant() + "=" + (HasSpecialization ? "1" : "0"));
+		}
 		
 		PublicIncludePaths.AddRange(
 			new string[] {

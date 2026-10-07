@@ -61,6 +61,8 @@ struct TBaseStructure<FAssetBundleEntry>
 	}
 };
 
+#if !UNREALCSHARP_ENGINE_BASE_FBOX
+// Preserve stock Engine support and avoid duplicate fork specializations.
 template <>
 struct TBaseStructure<FBox>
 {
@@ -69,7 +71,9 @@ struct TBaseStructure<FBox>
 		return StaticGetBaseStructureInternal(*BINDING_REMOVE_PREFIX_CLASS_STR(FBox));
 	}
 };
+#endif
 
+#if !UNREALCSHARP_ENGINE_BASE_FBOXSPHEREBOUNDS
 template <>
 struct TBaseStructure<FBoxSphereBounds>
 {
@@ -78,6 +82,7 @@ struct TBaseStructure<FBoxSphereBounds>
 		return StaticGetBaseStructureInternal(*BINDING_REMOVE_PREFIX_CLASS_STR(FBoxSphereBounds));
 	}
 };
+#endif
 
 #if UE_T_BASE_STRUCTURE_F_INT_VECTOR
 template <>

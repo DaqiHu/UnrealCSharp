@@ -1,4 +1,7 @@
 #include "Domain/Script/FScriptDomainFactory.h"
+#include "Misc/CommandLine.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Parse.h"
 #if WITH_MONO
 #include "Domain/Mono/FMonoDomain.h"
 #endif
@@ -8,6 +11,22 @@
 #if WITH_LEANCLR
 #include "Domain/LeanCLR/FLeanCLRDomain.h"
 #endif
+
+namespace
+{
+IScriptDomain* RecordBenchDomain(IScriptDomain* Domain, const TCHAR* Backend)
+{
+	FString OutputPath;
+	if (FParse::Value(FCommandLine::Get(), TEXT("BenchRuntimeTelemetry="), OutputPath))
+	{
+		// Record the branch that actually constructed the domain, outside timed loops.
+		FFileHelper::SaveStringToFile(FString::Printf(
+			TEXT("{\"backend\":\"%s\",\"source\":\"FScriptDomainFactory::Create constructed domain\"}"), Backend),
+			*OutputPath);
+	}
+	return Domain;
+}
+}
 
 EScriptDomainType FScriptDomainFactory::GetScriptDomainType()
 {
@@ -25,19 +44,19 @@ IScriptDomain* FScriptDomainFactory::Create()
 		ScriptDomainType == EScriptDomainType::Mono)
 	{
 #if WITH_MONO
-		return new FMonoDomain();
+		return RecordBenchDomain(new FMonoDomain(), TEXT("Mono"));
 #endif
 	}
 	else if (ScriptDomainType == EScriptDomainType::CoreCLR)
 	{
 #if WITH_CORECLR
-		return new FCoreCLRDomain();
+		return RecordBenchDomain(new FCoreCLRDomain(), TEXT("CoreCLR"));
 #endif
 	}
 	else if (ScriptDomainType == EScriptDomainType::LeanCLR)
 	{
 #if WITH_LEANCLR
-		return new FLeanCLRDomain();
+		return RecordBenchDomain(new FLeanCLRDomain(), TEXT("LeanCLR"));
 #endif
 	}
 
